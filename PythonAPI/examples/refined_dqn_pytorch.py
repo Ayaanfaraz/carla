@@ -179,8 +179,8 @@ class DQNAgent:
        
         self.model = self.create_model()
         ## target model (this is what we .predict against every step)
-        self.target_model = self.create_model()
-        self.target_model.set_weights(self.model.get_weights())
+        # self.target_model = self.create_model()
+        # self.target_model.set_weights(self.model.get_weights())
 
         self.terminate = False  # Should we quit?
         self.training_initialized = False  # waiting for TF to get rolling
@@ -212,44 +212,58 @@ class DQNAgent:
         ## if we do have the proper amount of data to train, we need to randomly select the data we want to train off from our memory
         minibatch = random.sample(self.replay_memory, MINIBATCH_SIZE)
 
-        ## get current states from minibatch and then get Q values from NN model
-        ## transition is being defined by this: transition = (current_state, action, reward, new_state, done)
-        current_states = np.array([transition[0] for transition in minibatch])/255
+        # ## get current states from minibatch and then get Q values from NN model
+        # ## transition is being defined by this: transition = (current_state, action, reward, new_state, done)
+        # current_states = np.array([transition[0] for transition in minibatch])/255
 
-        ## This is the changed model
-        current_qs_list = self.model.predict(current_states, PREDICTION_BATCH_SIZE)    ## changed
+        # ## This is the changed model
+        # current_qs_list = self.model.predict(current_states, PREDICTION_BATCH_SIZE)    ## changed
         
-        ## This is normal model
-        new_current_states = np.array([transition[3] for transition in minibatch])/255
-        future_qs_list = self.target_model.predict(new_current_states, PREDICTION_BATCH_SIZE)
+        # ## This is normal model
+        # new_current_states = np.array([transition[3] for transition in minibatch])/255
+        # future_qs_list = self.target_model.predict(new_current_states, PREDICTION_BATCH_SIZE)
 
-        ## image data(normalized RGB data): input
-        X = []
-        ## action we take(Q values): output
-        y = []
+        # ## image data(normalized RGB data): input
+        # X = []
+        # ## action we take(Q values): output
+        # y = []
 
-        ## calculate Q values for the next step based on Qnew equation
-        ## index = step
-        for index, (current_state, action, reward, new_state, done) in enumerate(minibatch):
+        # ## calculate Q values for the next step based on Qnew equation
+        # ## index = step
+        # for index, (current_state, action, reward, new_state, done) in enumerate(minibatch):
+        #     if not done:
+        #         max_future_q = np.max(future_qs_list[index])
+        #         new_q = reward + DISCOUNT * max_future_q``
+        #     else:
+        #         new_q = reward  
+
+        #     current_qs = current_qs_list[index]
+        #     current_qs[action] = new_q     ## Q for the action that we took is now equal to the new Q value
+
+        #     X.append(current_state)  ## image we have 
+        #     y.append(current_qs)  ## Q value we have
+
+        # ## fit our model
+        # self.model.fit(np.array(X)/255, np.array(y), batch_size=TRAINING_BATCH_SIZE, verbose=0, shuffle=False)
+        
+        # # If counter reaches set value, update target network with weights of main network
+        # if self.target_update_counter > UPDATE_TARGET_EVERY:
+        #     self.target_model.set_weights(self.model.get_weights())
+        #     self.target_update_counter = 0
+
+        states, targets_f = [],[]
+        for state, action, reward, next_state, done in minibatch:
+            # if done, set target = reward
+            target = reward
+            # if not done, predict future discounted reward with the Bellman equation
             if not done:
-                max_future_q = np.max(future_qs_list[index])
-                new_q = reward + DISCOUNT * max_future_q
-            else:
-                new_q = reward  
-
-            current_qs = current_qs_list[index]
-            current_qs[action] = new_q     ## Q for the action that we took is now equal to the new Q value
-
-            X.append(current_state)  ## image we have 
-            y.append(current_qs)  ## Q value we have
-
-        ## fit our model
-        self.model.fit(np.array(X)/255, np.array(y), batch_size=TRAINING_BATCH_SIZE, verbose=0, shuffle=False)
-        
-        # If counter reaches set value, update target network with weights of main network
-        if self.target_update_counter > UPDATE_TARGET_EVERY:
-            self.target_model.set_weights(self.model.get_weights())
-            self.target_update_counter = 0
+                target = (reward + DISCOUNT * np.amax(self.model.predict(next_state.reshape(-1, *state.shape)/255)[0]))
+            target_f = self.model.predict(np.array(state).reshape(-1, *state.shape)/255)
+            target_f[0][action] = target 
+            # filtering out states and targets for training
+            states.append(state[0])
+            targets_f.append(target_f[0])
+        self.model.fit(np.array(states), np.array(targets_f), batch_size=TRAINING_BATCH_SIZE, verbose=1)
 
     def get_qs(self, state):
         q_out = self.model.predict(np.array(state).reshape(-1, *state.shape)/255)[0]

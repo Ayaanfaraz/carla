@@ -53,7 +53,7 @@ EPISODES = 1000
 
 DISCOUNT = 0.99
 epsilon = 1
-EPSILON_DECAY = 0.995 ## 0.9975 99975
+EPSILON_DECAY = 0.95 ## 0.9975 99975
 MIN_EPSILON = 0.001
 
 AGGREGATE_STATS_EVERY = 5  ## checking per 5 episodes
@@ -74,24 +74,12 @@ class CarEnv:
         self.map = self.world.get_map()   ## added for map creating
         self.blueprint_library = self.world.get_blueprint_library()
 
-        # weather = carla.WeatherParameters(
-        #     cloudyness=10.0,
-        #     precipitation=10.0,
-        #     sun_altitude_angle=90.0)
-
-        # self.world.set_weather(weather)
-
         self.model_3 = self.blueprint_library.filter("model3")[0]  ## grab tesla model3 from library
-
-
             
 
     def reset(self):
         self.collision_hist = []    
         self.actor_list = []
-        
-
-
 
         self.waypoints = self.client.get_world().get_map().generate_waypoints(distance=3.0)
 
@@ -109,32 +97,7 @@ class CarEnv:
         self.spawn_point = self.filtered_waypoints[1].transform
 
         self.spawn_point.location.z += 2
-        self.vehicle = self.world.spawn_actor(self.model_3, self.spawn_point)  ## changed for adding waypoints
-
-
-
-
-
-        # self.spawn_points = self.map.get_spawn_points()
-
-        # self.vehicle = self.world.spawn_actor(self.model_3, self.spawn_points)  ## changed for adding waypoints
-
-        # self.waypoint = self.map.get_waypoint(self.vehicle.get_location())
-        # self.vehicle.set_simulate_physics(False)
-
-        # self.world.debug.draw_string(self.waypoint.transform.location, 'O', draw_shadow=False,
-        #                            color=carla.Color(r=0, g=255, b=0), life_time=40,
-        #                            persistent_lines=True)
-        # while True:
-        #     # Find next waypoint 2 meters ahead.
-        #     self.waypoint = random.choice(self.waypoint.next(20.0))
-        #     # Teleport the vehicle.
-        #     self.vehicle.set_transform(self.waypoint.transform)
-
-        # self.transform = random.choice(self.world.get_map().get_spawn_points())
-        # self.vehicle = self.world.spawn_actor(self.model_3, self.transform)
-        
-
+        self.vehicle = self.world.spawn_actor(self.model_3, self.spawn_point)  ## changed for adding waypoi
 
         
         self.actor_list.append(self.vehicle)
@@ -144,8 +107,13 @@ class CarEnv:
         self.rgb_cam.set_attribute("image_size_y", f"{self.im_height}")
         self.rgb_cam.set_attribute("fov", f"110")  ## fov, field of view
 
+        self.ss_cam = self.blueprint_library.find('sensor.camera.semantic_segmentation')
+        self.ss_cam.set_attribute("image_size_x", f"{self.im_width}")
+        self.ss_cam.set_attribute("image_size_y", f"{self.im_height}")
+        self.ss_cam.set_attribute("fov", f"110")  ## fov, field of view
+
         transform = carla.Transform(carla.Location(x=2.5, z=0.7))
-        self.sensor = self.world.spawn_actor(self.rgb_cam, transform, attach_to=self.vehicle)
+        self.sensor = self.world.spawn_actor(self.ss_cam, transform, attach_to=self.vehicle)
         self.actor_list.append(self.sensor)
         self.sensor.listen(lambda data: self.process_img(data))
         self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0)) # initially passing some commands seems to help with time. Not sure why.
@@ -195,48 +163,24 @@ class CarEnv:
         v = self.vehicle.get_velocity()
         kmh = int(3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2))
       
-        
 
+        if len(self.collision_hist) != 0:
+            done = True
+            reward = -300
+        elif kmh < 30:
+            done = False
+            reward = -5
+        elif carla.Location.distance(carla.Actor.get_location(self.actor_list[0]), self.filtered_waypoints[i].transform.location) == 0:
+            done = False
+            reward = 25
+        else:
+            done = False
+            reward = 30
 
-        # if len(self.collision_hist) != 0:
-        #         done = True
-        #         reward = -200
-        # elif kmh < 50:
-        #         done = False
-        #         reward = -1
-        # elif carla.Location.distance(self, self.waypoint) == 0:
-        #         done = False
-        #         reward = 150
-        # else:
-        #         done = False
-        #         reward = 10
+        if self.episode_start + SECONDS_PER_EPISODE < time.time():  ## when to stop
+            done = True
 
-        # if self.episode_start + SECONDS_PER_EPISODE < time.time():  ## when to stop
-        #         done = True
-
-        # return self.front_camera, reward, done, None
-        i = 2
-        for i in range(2, len(self.filtered_waypoints)):
-
-
-            if len(self.collision_hist) != 0:
-                done = True
-                reward = -300
-            elif kmh < 30:
-                done = False
-                reward = -5
-            elif carla.Location.distance(carla.Actor.get_location(self.actor_list[0]), self.filtered_waypoints[i].transform.location) == 0:
-                done = False
-                reward = 25
-            else:
-                done = False
-                reward = 30
-            i = i + 1
-
-            if self.episode_start + SECONDS_PER_EPISODE < time.time():  ## when to stop
-                done = True
-
-            return self.front_camera, reward, done, None
+        return self.front_camera, reward, done, None
 
 
 
@@ -262,30 +206,30 @@ class DQNAgent:
     def create_model(self):
         ## input: RGB data, should be normalized when coming into CNN
 
-        # base_model = tf.keras.applications.Xception(weights=None, include_top=False, input_shape=(IM_HEIGHT, IM_WIDTH,3)) 
-        # x = base_model.output
-        # x = GlobalAveragePooling2D()(x)
-        # x = Flatten()(x) 
+        base_model = tf.keras.applications.Xception(weights=None, include_top=False, input_shape=(IM_HEIGHT, IM_WIDTH,3)) 
+        x = base_model.output
+        x = GlobalAveragePooling2D()(x)
+        x = Flatten()(x) 
 
-        # predictions = Dense(3, activation="linear")(x)  ## output layer include three nuros, representing three actions
-        # model = Model(inputs=base_model.input, outputs=predictions)
-        # model.compile(loss="mse", optimizer="Adam", metrics=["accuracy"])                                 ## changed
-        # return model
-
-        base_model = tf.keras.applications.ResNet50(weights='imagenet', include_top=False, input_shape=(480, 640, 3))
-        base_model.trainable = False
-        # Additional Linear Layers
-        inputs = tf.keras.Input(shape=(480, 640, 3))
-        x = base_model(inputs, training=False)
-        x = tf.keras.layers.GlobalAveragePooling2D()(x)
-        x = tf.keras.layers.Flatten()(x)
-        x = tf.keras.layers.Dense(units=40, activation='relu')(x)
-        output = tf.keras.layers.Dense(units=3, activation='linear')(x)
-        # Compile the Model
-        model = tf.keras.Model(inputs, output)
-        model.compile(loss='mse', optimizer=tf.keras.optimizers.Adam(learning_rate=0.001))
-        print(model.summary)
+        predictions = Dense(3, activation="linear")(x)  ## output layer include three nuros, representing three actions
+        model = Model(inputs=base_model.input, outputs=predictions)
+        model.compile(loss="mse", optimizer="Adam", metrics=["accuracy"])                                 ## changed
         return model
+
+        # base_model = tf.keras.applications.ResNet50(weights='imagenet', include_top=False, input_shape=(480, 640, 3))
+        # base_model.trainable = False
+        # # Additional Linear Layers
+        # inputs = tf.keras.Input(shape=(480, 640, 3))
+        # x = base_model(inputs, training=False)
+        # x = tf.keras.layers.GlobalAveragePooling2D()(x)
+        # x = tf.keras.layers.Flatten()(x)
+        # x = tf.keras.layers.Dense(units=40, activation='relu')(x)
+        # output = tf.keras.layers.Dense(units=3, activation='linear')(x)
+        # # Compile the Model
+        # model = tf.keras.Model(inputs, output)
+        # model.compile(loss='mse', optimizer=tf.keras.optimizers.Adam(learning_rate=0.001))
+        # print(model.summary)
+        # return model
 
     ## function handler
     # Adds step's data to a memory replay array
