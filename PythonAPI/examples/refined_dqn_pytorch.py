@@ -8,17 +8,17 @@ import sys
 import numpy as np
 import cv2
 import math
+
 from collections import deque
 import tensorflow as tf
-# from keras.applications.xception import Xception
-from keras.layers import Dense, GlobalAveragePooling2D, Flatten
-from tensorflow.keras.optimizers import Adam
-from keras.models import Model
-from keras.callbacks import TensorBoard
-import tensorflow.keras.backend as backend
 from threading import Thread
 from tqdm import tqdm
+
 import matplotlib.pyplot as plt
+import xception
+import torch.nn as nn
+import torch.optim as optim
+import torch
 
 "Starting script for any carla programming"
 
@@ -48,11 +48,11 @@ MODEL_NAME = "Xception"
 MEMORY_FRACTION = 0.8
 MIN_REWARD = -200
 
-EPISODES = 1000
+EPISODES = 100
 
 DISCOUNT = 0.99
 epsilon = 1
-EPSILON_DECAY = 0.99 ## 0.9975 99975
+EPSILON_DECAY = 0.95 ## 0.9975 99975
 MIN_EPSILON = 0.001
 
 AGGREGATE_STATS_EVERY = 5  ## checking per 5 episodes
@@ -178,24 +178,14 @@ class DQNAgent:
         self.target_update_counter = 0  # will track when it's time to update the target model
        
         self.model = self.create_model()
-        ## target model (this is what we .predict against every step)
-        # self.target_model = self.create_model()
-        # self.target_model.set_weights(self.model.get_weights())
-
+        self.loss = nn.MSELoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.terminate = False  # Should we quit?
         self.training_initialized = False  # waiting for TF to get rolling
 
     def create_model(self):
         ## input: RGB data, should be normalized when coming into CNN
-
-        base_model = tf.keras.applications.Xception(weights=None, include_top=False, input_shape=(IM_HEIGHT, IM_WIDTH,3)) 
-        x = base_model.output
-        x = GlobalAveragePooling2D()(x)
-        x = Flatten()(x) 
-        #2048 fcn
-        predictions = Dense(3, activation="linear")(x)  ## output layer include three nuros, representing three actions
-        model = Model(inputs=base_model.input, outputs=predictions)
-        model.compile(loss="mse", optimizer="Adam", metrics=["accuracy"])                                 ## changed
+        model = xception.xception(num_classes=3, pretrained=False)
         return model
 
     # Adds step's data to a memory replay array
@@ -212,68 +202,45 @@ class DQNAgent:
         ## if we do have the proper amount of data to train, we need to randomly select the data we want to train off from our memory
         minibatch = random.sample(self.replay_memory, MINIBATCH_SIZE)
 
-        # ## get current states from minibatch and then get Q values from NN model
-        # ## transition is being defined by this: transition = (current_state, action, reward, new_state, done)
-        # current_states = np.array([transition[0] for transition in minibatch])/255
-
-        # ## This is the changed model
-        # current_qs_list = self.model.predict(current_states, PREDICTION_BATCH_SIZE)    ## changed
-        
-        # ## This is normal model
-        # new_current_states = np.array([transition[3] for transition in minibatch])/255
-        # future_qs_list = self.target_model.predict(new_current_states, PREDICTION_BATCH_SIZE)
-
-        # ## image data(normalized RGB data): input
-        # X = []
-        # ## action we take(Q values): output
-        # y = []
-
-        # ## calculate Q values for the next step based on Qnew equation
-        # ## index = step
-        # for index, (current_state, action, reward, new_state, done) in enumerate(minibatch):
-        #     if not done:
-        #         max_future_q = np.max(future_qs_list[index])
-        #         new_q = reward + DISCOUNT * max_future_q``
-        #     else:
-        #         new_q = reward  
-
-        #     current_qs = current_qs_list[index]
-        #     current_qs[action] = new_q     ## Q for the action that we took is now equal to the new Q value
-
-        #     X.append(current_state)  ## image we have 
-        #     y.append(current_qs)  ## Q value we have
-
-        # ## fit our model
-        # self.model.fit(np.array(X)/255, np.array(y), batch_size=TRAINING_BATCH_SIZE, verbose=0, shuffle=False)
-        
-        # # If counter reaches set value, update target network with weights of main network
-        # if self.target_update_counter > UPDATE_TARGET_EVERY:
-        #     self.target_model.set_weights(self.model.get_weights())
-        #     self.target_update_counter = 0
-
         states, targets_f = [],[]
         for state, action, reward, next_state, done in minibatch:
             # if done, set target = reward
             target = reward
             # if not done, predict future discounted reward with the Bellman equation
             if not done:
-                target = (reward + DISCOUNT * np.amax(self.model.predict(next_state.reshape(-1, *state.shape)/255)[0]))
-            target_f = self.model.predict(np.array(state).reshape(-1, *state.shape)/255)
+                #next_state.reshape(-1, *state.shape)/255
+               
+                target = (reward + DISCOUNT * torch.amax(self.model(torch.unsqueeze(torch.from_numpy(next_state), 0).permute(0,3,1,2)/255)[0]))
+            target_f = self.model(torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255)
             target_f[0][action] = target 
             # filtering out states and targets for training
             states.append(state[0])
             targets_f.append(target_f[0])
-        self.model.fit(np.array(states), np.array(targets_f), batch_size=TRAINING_BATCH_SIZE, verbose=1)
+
+        #self.model.fit(np.array(states), np.array(targets_f), batch_size=TRAINING_BATCH_SIZE, verbose=1)
+        self.model.train()
+
+        for i in range(len(states)):
+            self.optimizer.zero_grad()
+
+            x    = states[i]
+            y    = targets_f[i]
+
+            yhat = self.model(x)
+            self.loss = nn.MSELoss(yhat, y)
+
+            self.loss.backward()
+            self.optimizer.step()
 
     def get_qs(self, state):
-        q_out = self.model.predict(np.array(state).reshape(-1, *state.shape)/255)[0]
+        q_out = self.model(torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255)[0]
         return q_out
 
         ## first to train to some nonsense. just need to get a quicl fitment because the first training and predication is slow
     def train_in_loop(self):
-        X = np.random.uniform(size=(1, IM_HEIGHT, IM_WIDTH, 3)).astype(np.float32)
-        y = np.random.uniform(size=(1, 3)).astype(np.float32)
-        self.model.fit(X,y, verbose=False, batch_size=1)
+        # X = np.random.uniform(size=(1, IM_HEIGHT, IM_WIDTH, 3)).astype(np.float32)
+        # y = np.random.uniform(size=(1, 3)).astype(np.float32)
+        # self.model.fit(X,y, verbose=False, batch_size=1)
 
         self.training_initialized = True
 
@@ -308,7 +275,7 @@ if __name__ == '__main__':
         time.sleep(0.01)
 
     ## 
-    agent.get_qs(np.ones((env.im_height, env.im_width, 3)))
+    #agent.get_qs(np.ones((env.im_height, env.im_width, 3), dtype=float))
     rewards = []
     episode_list = []
     # Iterate over episodes
@@ -337,7 +304,7 @@ if __name__ == '__main__':
                 # we will get Q values baed on tranning, but otherwise, we will go random actions.
                 if np.random.random() > epsilon:
                     # Get action from Q table
-                    action = np.argmax(agent.get_qs(current_state))
+                    action = torch.argmax(agent.get_qs(current_state))
                 else:
                     # Get random action
                     action = np.random.randint(0, 3)

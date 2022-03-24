@@ -53,7 +53,7 @@ EPISODES = 1000
 
 DISCOUNT = 0.99
 epsilon = 1
-EPSILON_DECAY = 0.95 ## 0.9975 99975
+EPSILON_DECAY = 0.995 ## 0.9975 99975
 MIN_EPSILON = 0.001
 
 AGGREGATE_STATS_EVERY = 5  ## checking per 5 episodes
@@ -170,7 +170,7 @@ class CarEnv:
         elif kmh < 30:
             done = False
             reward = -5
-        elif carla.Location.distance(carla.Actor.get_location(self.actor_list[0]), self.filtered_waypoints[i].transform.location) == 0:
+        elif carla.Location.distance(carla.Actor.get_location(self.actor_list[0]), self.filtered_waypoints[2].transform.location) == 0:
             done = False
             reward = 25
         else:
@@ -270,6 +270,7 @@ class DQNAgent:
         ## index = step
         for index, (current_state, action, reward, new_state, done) in enumerate(minibatch):
             if not done:
+                print("New state Dimension: ", new_state.shape)
                 max_future_q = np.max(future_qs_list[index])
                 new_q = reward + DISCOUNT * max_future_q
             else:
@@ -432,6 +433,7 @@ if __name__ == '__main__':
                     time.sleep(1/FPS)
 
                 new_state, reward, done, _ = env.step(action)
+                print("New state: ", new_state.shape)
 
                 # Transform new continous state to new discrete state and count reward
                 episode_reward += reward
