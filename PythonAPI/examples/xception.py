@@ -78,9 +78,9 @@ pretrained_settings = {
 
             'input_range': [0, 1],
 
-            'mean': [0.5, 0.5, 0.5],
+            'mean': [0.534603774547577, 0.570066750049591, 0.589080333709717],
 
-            'std': [0.5, 0.5, 0.5],
+            'std': [0.186295211315155, 0.181921467185020, 0.196240469813347],
 
             'num_classes': 1000,
 
@@ -471,6 +471,8 @@ def xception(num_classes=1000, pretrained='imagenet'):
         model.mean = settings['mean']
 
         model.std = settings['std']
+
+        #model.load_state_dict(model_zoo.load_url(settings['url']))
 
 
 

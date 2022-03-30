@@ -20,6 +20,10 @@ import torch.nn as nn
 import torch.optim as optim
 import torch
 
+import jerrys_helpers
+import tiramisuModel.tiramisu as tiramisu
+from torchvision import transforms
+
 "Starting script for any carla programming"
 
 try:
@@ -33,8 +37,8 @@ except IndexError:
 import carla
 from carla import ColorConverter as cc
 
-IM_WIDTH = 640
-IM_HEIGHT = 480
+IM_WIDTH = 300
+IM_HEIGHT = 300
 SECONDS_PER_EPISODE = 20
 REPLAY_MEMORY_SIZE = 5_000
 
@@ -57,6 +61,17 @@ MIN_EPSILON = 0.001
 
 AGGREGATE_STATS_EVERY = 5  ## checking per 5 episodes
 SHOW_PREVIEW  = True    ## for debugging purpose
+
+#Load up Jerrys pretrained model
+semantic_uncertainty_model = tiramisu.FCDenseNet67(n_classes=23).cuda()
+semantic_uncertainty_model.float()
+jerrys_helpers.load_weights(semantic_uncertainty_model,'models/weights67latest.th')
+
+transform_norm = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean = [0.534603774547577, 0.570066750049591, 0.589080333709717],
+    std = [0.186295211315155, 0.181921467185020, 0.196240469813347])
+])
 
 class CarEnv:
     SHOW_CAM = SHOW_PREVIEW
@@ -87,17 +102,18 @@ class CarEnv:
 
         self.actor_list.append(self.vehicle)
 
-        # self.rgb_cam = self.blueprint_library.find('sensor.camera.rgb')
-        # self.rgb_cam.set_attribute("image_size_x", f"{self.im_width}")
-        # self.rgb_cam.set_attribute("image_size_y", f"{self.im_height}")
-        # self.rgb_cam.set_attribute("fov", f"110")  ## fov, field of view
+        self.rgb_cam = self.blueprint_library.find('sensor.camera.rgb')
+        self.rgb_cam.set_attribute("image_size_x", f"{self.im_width}")
+        self.rgb_cam.set_attribute("image_size_y", f"{self.im_height}")
+        self.rgb_cam.set_attribute("fov", f"110")  ## fov, field of view
+
         self.ss_cam = self.blueprint_library.find('sensor.camera.semantic_segmentation')
         self.ss_cam.set_attribute("image_size_x", f"{self.im_width}")
         self.ss_cam.set_attribute("image_size_y", f"{self.im_height}")
         self.ss_cam.set_attribute("fov", f"110")
 
         transform = carla.Transform(carla.Location(x=2.5, z=0.7))
-        self.sensor = self.world.spawn_actor(self.ss_cam, transform, attach_to=self.vehicle)
+        self.sensor = self.world.spawn_actor(self.rgb_cam, transform, attach_to=self.vehicle)
         self.actor_list.append(self.sensor)
         self.sensor.listen(lambda data: self.process_img(data))
         self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0)) # initially passing some commands seems to help with time. Not sure why.
@@ -121,14 +137,58 @@ class CarEnv:
         self.collision_hist.append(event)
 
     def process_img(self, image):
-        image.convert(cc.CityScapesPalette)
+        #image.convert(cc.CityScapesPalette)
+        #image.save_to_disk('image/%08d' % image.frame)
+
         i = np.array(image.raw_data)
         i2 = i.reshape((self.im_height, self.im_width, 4))
-        i3 = i2[:, :, :3]
+        image = i2[:, :, :3]
+       
+        ## #Get semantic image ######
+        normalized_image = transform_norm(image)
+        rgb_input = torch.unsqueeze(normalized_image, 0)
+        rgb_input = rgb_input.to(torch.device("cuda"))
+
+        semantic_uncertainty_model.eval()
+        model_output = semantic_uncertainty_model(rgb_input) #Put single image rgb in tensor and pass in
+        raw_semantic = jerrys_helpers.get_predictions(model_output) #Gets an unlabeled semantic image (red one)
+        rgb_semantic = jerrys_helpers.color_semantic(raw_semantic[0]) #gets color converted semantic (like our convert cityscape)
+
+        #Convert Jerry model float64 input to uint8
+        rgb_semantic = cv2.normalize(src=rgb_semantic, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        ##### Get Semantic Image #######
+
+
+        #### Get Uncertainty Image ######
+        semantic_uncertainty_model.train() 
+        mc_results = []
+
+        # output.shape = (1, 23, 480, 640)
+        # output = model(data).cpu().data.numpy()
+        output = semantic_uncertainty_model(rgb_input).cpu().detach().numpy()
+        output = np.squeeze(output)
+        # RESHAPE OUTPUT BEFORE PUTTING IT INTO mc_results
+        # reshape into (480000, 23)
+        # then softmax it
+        output = jerrys_helpers.get_pixels(output)
+        output = jerrys_helpers.softmax(output)
+        mc_results.append(output)
+        
+        # boom we got num_samples passes of a single img thru the NN
+        # now we use those samples to make uncertainty maps  
+        mc_results = [mc_results]
+        aleatoric = jerrys_helpers.calc_aleatoric(mc_results)[0]
+        aleatoric = np.reshape(aleatoric, (IM_HEIGHT, IM_WIDTH))
+        aleatoric = cv2.normalize(src=aleatoric, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        
+        cv2.imshow("aleatoric",aleatoric)
+        cv2.waitKey(1)
+        ###### Get Uncertainty Image ######
+
         if self.SHOW_CAM:
-            cv2.imshow("",i3)
+            cv2.imshow("", rgb_semantic)
             cv2.waitKey(1)
-        self.front_camera = i3  ## remember to scale this down between 0 and 1 for CNN input purpose
+        self.front_camera = image  ## remember to scale this down between 0 and 1 for CNN input purpose
 
 
     def step(self, action):
@@ -185,7 +245,7 @@ class DQNAgent:
 
     def create_model(self):
         ## input: RGB data, should be normalized when coming into CNN
-        model = xception.xception(num_classes=3, pretrained=False)
+        model = xception.xception(num_classes=3, pretrained=False).float()
         return model
 
     # Adds step's data to a memory replay array
@@ -293,6 +353,8 @@ if __name__ == '__main__':
 
             # Reset environment and get initial state
             current_state = env.reset()
+            #print("state shape: ", current_state.shape)
+            #print("type ", type(current_state))
 
             # Reset flag and start iterating until episode ends
             done = False
