@@ -23,6 +23,8 @@ import torch
 import jerrys_helpers
 import tiramisuModel.tiramisu as tiramisu
 from torchvision import transforms
+# import mergedModel.MyEnsemble as fusionModel
+from mergedModel import MyEnsemble as fusionModel
 
 "Starting script for any carla programming"
 
@@ -145,15 +147,15 @@ class CarEnv:
         image = i2[:, :, :3]
        
         ## #Get semantic image ######
+        # Normalize rgb input Image
         normalized_image = transform_norm(image)
         rgb_input = torch.unsqueeze(normalized_image, 0)
         rgb_input = rgb_input.to(torch.device("cuda"))
-
+        # Get semantic segmented raw output
         semantic_uncertainty_model.eval()
         model_output = semantic_uncertainty_model(rgb_input) #Put single image rgb in tensor and pass in
         raw_semantic = jerrys_helpers.get_predictions(model_output) #Gets an unlabeled semantic image (red one)
         rgb_semantic = jerrys_helpers.color_semantic(raw_semantic[0]) #gets color converted semantic (like our convert cityscape)
-
         #Convert Jerry model float64 input to uint8
         rgb_semantic = cv2.normalize(src=rgb_semantic, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
         ##### Get Semantic Image #######
@@ -162,9 +164,6 @@ class CarEnv:
         #### Get Uncertainty Image ######
         semantic_uncertainty_model.train() 
         mc_results = []
-
-        # output.shape = (1, 23, 480, 640)
-        # output = model(data).cpu().data.numpy()
         output = semantic_uncertainty_model(rgb_input).cpu().detach().numpy()
         output = np.squeeze(output)
         # RESHAPE OUTPUT BEFORE PUTTING IT INTO mc_results
@@ -180,8 +179,7 @@ class CarEnv:
         aleatoric = jerrys_helpers.calc_aleatoric(mc_results)[0]
         aleatoric = np.reshape(aleatoric, (IM_HEIGHT, IM_WIDTH))
         aleatoric = cv2.normalize(src=aleatoric, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        
-        cv2.imshow("aleatoric",aleatoric)
+        cv2.imshow("aleatoric", aleatoric)
         cv2.waitKey(1)
         ###### Get Uncertainty Image ######
 
@@ -237,7 +235,7 @@ class DQNAgent:
         self.replay_memory = deque(maxlen=REPLAY_MEMORY_SIZE)   ## batch step
         self.target_update_counter = 0  # will track when it's time to update the target model
        
-        self.model = self.create_model()
+        self.model = fusionModel(semantic_model=self.create_model(), uncertainty_model=self.create_model())
         self.loss = nn.MSELoss()
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.terminate = False  # Should we quit?
@@ -245,7 +243,7 @@ class DQNAgent:
 
     def create_model(self):
         ## input: RGB data, should be normalized when coming into CNN
-        model = xception.xception(num_classes=3, pretrained=False).float()
+        model = xception.xception(num_classes=2048, pretrained=False).float()
         return model
 
     # Adds step's data to a memory replay array
@@ -271,7 +269,7 @@ class DQNAgent:
                 #next_state.reshape(-1, *state.shape)/255
                
                 target = (reward + DISCOUNT * torch.amax(self.model(torch.unsqueeze(torch.from_numpy(next_state), 0).permute(0,3,1,2)/255)[0]))
-            target_f = self.model(torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255)
+            target_f = self.model(torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255, torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255)
             target_f[0][action] = target 
             # filtering out states and targets for training
             states.append(state[0])
@@ -293,7 +291,7 @@ class DQNAgent:
             self.optimizer.step()
 
     def get_qs(self, state):
-        q_out = self.model(torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255)[0]
+        q_out = self.model(torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255, torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255 )[0]
         return q_out
 
         ## first to train to some nonsense. just need to get a quicl fitment because the first training and predication is slow
