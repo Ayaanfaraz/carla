@@ -23,7 +23,6 @@ import torch
 import jerrys_helpers
 import tiramisuModel.tiramisu as tiramisu
 from torchvision import transforms
-# import mergedModel.MyEnsemble as fusionModel
 from mergedModel import MyEnsemble as fusionModel
 
 "Starting script for any carla programming"
@@ -48,7 +47,6 @@ MIN_REPLAY_MEMORY_SIZE = 1_000
 MINIBATCH_SIZE = 16
 PREDICTION_BATCH_SIZE = 1
 TRAINING_BATCH_SIZE = MINIBATCH_SIZE // 4
-UPDATE_TARGET_EVERY = 5  #used to be 10
 MODEL_NAME = "Xception"
 
 MEMORY_FRACTION = 0.8
@@ -65,7 +63,7 @@ AGGREGATE_STATS_EVERY = 5  ## checking per 5 episodes
 SHOW_PREVIEW  = True    ## for debugging purpose
 
 #Load up Jerrys pretrained model
-semantic_uncertainty_model = tiramisu.FCDenseNet67(n_classes=23).cuda()
+semantic_uncertainty_model = tiramisu.FCDenseNet67(n_classes=23).to(device='cuda:0')
 semantic_uncertainty_model.float()
 jerrys_helpers.load_weights(semantic_uncertainty_model,'models/weights67latest.th')
 
@@ -85,7 +83,6 @@ class CarEnv:
     def __init__(self):
         self.client = carla.Client('127.0.0.1', 2000)
         self.client.set_timeout(2.0)
-        # self.actor = carla.Actor
         self.world = self.client.load_world('Town04')
         self.map = self.world.get_map()   ## added for map creating
         self.blueprint_library = self.world.get_blueprint_library()
@@ -140,8 +137,6 @@ class CarEnv:
 
     def process_img(self, image):
         #image.convert(cc.CityScapesPalette)
-        #image.save_to_disk('image/%08d' % image.frame)
-
         i = np.array(image.raw_data)
         i2 = i.reshape((self.im_height, self.im_width, 4))
         image = i2[:, :, :3]
@@ -150,9 +145,9 @@ class CarEnv:
         # Normalize rgb input Image
         normalized_image = transform_norm(image)
         rgb_input = torch.unsqueeze(normalized_image, 0)
-        rgb_input = rgb_input.to(torch.device("cuda"))
+        rgb_input = rgb_input.to(torch.device("cuda:0"))
         # Get semantic segmented raw output
-        semantic_uncertainty_model.eval()
+        semantic_uncertainty_model.eval().to(device='cuda:0')
         model_output = semantic_uncertainty_model(rgb_input) #Put single image rgb in tensor and pass in
         raw_semantic = jerrys_helpers.get_predictions(model_output) #Gets an unlabeled semantic image (red one)
         rgb_semantic = jerrys_helpers.color_semantic(raw_semantic[0]) #gets color converted semantic (like our convert cityscape)
@@ -162,9 +157,9 @@ class CarEnv:
 
 
         #### Get Uncertainty Image ######
-        semantic_uncertainty_model.train() 
+        semantic_uncertainty_model.train().to(device='cuda:0')
         mc_results = []
-        output = semantic_uncertainty_model(rgb_input).cpu().detach().numpy()
+        output = semantic_uncertainty_model(rgb_input).detach().cpu().numpy()
         output = np.squeeze(output)
         # RESHAPE OUTPUT BEFORE PUTTING IT INTO mc_results
         # reshape into (480000, 23)
@@ -179,14 +174,15 @@ class CarEnv:
         aleatoric = jerrys_helpers.calc_aleatoric(mc_results)[0]
         aleatoric = np.reshape(aleatoric, (IM_HEIGHT, IM_WIDTH))
         aleatoric = cv2.normalize(src=aleatoric, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        aleatoric = cv2.merge((aleatoric,aleatoric,aleatoric))
+        ###### Get Uncertainty Image ######
         cv2.imshow("aleatoric", aleatoric)
         cv2.waitKey(1)
-        ###### Get Uncertainty Image ######
 
-        if self.SHOW_CAM:
-            cv2.imshow("", rgb_semantic)
-            cv2.waitKey(1)
-        self.front_camera = image  ## remember to scale this down between 0 and 1 for CNN input purpose
+        cv2.imshow("", rgb_semantic)
+        cv2.waitKey(1)
+
+        self.front_camera = (rgb_semantic, aleatoric)  ## remember to scale this down between 0 and 1 for CNN input purpose
 
 
     def step(self, action):
@@ -242,8 +238,7 @@ class DQNAgent:
         self.training_initialized = False  # waiting for TF to get rolling
 
     def create_model(self):
-        ## input: RGB data, should be normalized when coming into CNN
-        model = xception.xception(num_classes=2048, pretrained=False).float()
+        model = xception.xception(num_classes=2048, pretrained=False).float()#.to(device="cuda:1")
         return model
 
     # Adds step's data to a memory replay array
@@ -263,43 +258,44 @@ class DQNAgent:
         states, targets_f = [],[]
         for state, action, reward, next_state, done in minibatch:
             # if done, set target = reward
+            #state = state.to(torch.device('cuda:1'))
             target = reward
             # if not done, predict future discounted reward with the Bellman equation
             if not done:
-                #next_state.reshape(-1, *state.shape)/255
-               
-                target = (reward + DISCOUNT * torch.amax(self.model(torch.unsqueeze(torch.from_numpy(next_state), 0).permute(0,3,1,2)/255)[0]))
-            target_f = self.model(torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255, torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255)
+                target = (reward + DISCOUNT * torch.amax(
+                    self.model(torch.unsqueeze(torch.from_numpy(next_state[0][0]), 0).permute(0,3,1,2)/255,
+                    torch.unsqueeze(torch.from_numpy(next_state[0][1]), 0).permute(0,3,1,2)/255)[0])) #cuda 1 here
+
+            target_f = self.model(torch.unsqueeze(torch.from_numpy(state[0][0]), 0).permute(0,3,1,2)/255,
+             torch.unsqueeze(torch.from_numpy(state[0][1]), 0).permute(0,3,1,2)/255) # cuda 1 here
             target_f[0][action] = target 
             # filtering out states and targets for training
-            states.append(state[0])
-            targets_f.append(target_f[0])
 
-        #self.model.fit(np.array(states), np.array(targets_f), batch_size=TRAINING_BATCH_SIZE, verbose=1)
-        self.model.train()
+            states.append((state[0][0],state[0][1])) #Add the uncertainty/semantic segmented tuple
+            targets_f.append(target_f[0])
+        self.model.train()#.to(device='cuda:1')
 
         for i in range(len(states)):
             self.optimizer.zero_grad()
 
-            x    = states[i]
+            x1    = states[i][0] #Semantic
+            x2    = states[i][1]#Uncertainty
             y    = targets_f[i]
 
-            yhat = self.model(x)
-            self.loss = nn.MSELoss(yhat, y)
+            yhat = self.model(x1,x2)
+            self.loss = nn.MSELoss(yhat, y)#.to(device='cuda:1')
 
             self.loss.backward()
             self.optimizer.step()
 
     def get_qs(self, state):
-        q_out = self.model(torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255, torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255 )[0]
+        #.to(device='cuda:1')
+        q_out = self.model(
+            torch.unsqueeze(torch.from_numpy(state[0]), 0).permute(0,3,1,2)/255, 
+            torch.unsqueeze(torch.from_numpy(state[1]), 0).permute(0,3,1,2)/255)[0] 
         return q_out
 
-        ## first to train to some nonsense. just need to get a quicl fitment because the first training and predication is slow
     def train_in_loop(self):
-        # X = np.random.uniform(size=(1, IM_HEIGHT, IM_WIDTH, 3)).astype(np.float32)
-        # y = np.random.uniform(size=(1, 3)).astype(np.float32)
-        # self.model.fit(X,y, verbose=False, batch_size=1)
-
         self.training_initialized = True
 
         while True:
@@ -332,8 +328,6 @@ if __name__ == '__main__':
     while not agent.training_initialized:
         time.sleep(0.01)
 
-    ## 
-    #agent.get_qs(np.ones((env.im_height, env.im_width, 3), dtype=float))
     rewards = []
     episode_list = []
     # Iterate over episodes
@@ -351,8 +345,6 @@ if __name__ == '__main__':
 
             # Reset environment and get initial state
             current_state = env.reset()
-            #print("state shape: ", current_state.shape)
-            #print("type ", type(current_state))
 
             # Reset flag and start iterating until episode ends
             done = False
@@ -360,8 +352,9 @@ if __name__ == '__main__':
             # Play for given number of seconds only
             while True:
 
-                # np.random.random() will give us the random number between 0 and 1. If this number is greater than our randomness variable,
-                # we will get Q values baed on tranning, but otherwise, we will go random actions.
+                # np.random.random() will give us the random number between 0 and 1.
+                # If this number is greater than our randomness variable,
+                # we will get Q values based on tranning, but otherwise, we will go random actions.
                 if np.random.random() > epsilon:
                     # Get action from Q table
                     action = torch.argmax(agent.get_qs(current_state))
@@ -402,11 +395,11 @@ if __name__ == '__main__':
             #plt.figure(1)
             plt.xlabel('Episodes')
             plt.ylabel('Rewards')
-            plt.title(str('All waypoints semantic, Full Xception Model, final_eps:{:f} '.format(epsilon)))  
+            plt.title(str('Training:{:f} '.format(epsilon)))  
             plt.plot(episode_list, rewards)
             plt.savefig('_out/reward_graph.png')
     
     # Set termination flag for training thread and wait for it to finish
     agent.terminate = True
     trainer_thread.join()
-    agent.model.save('models/all_waypoints_model')
+    #agent.model.save('models/all_waypoints_model')
