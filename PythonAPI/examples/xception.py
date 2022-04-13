@@ -74,7 +74,7 @@ pretrained_settings = {
 
             'input_space': 'RGB',
 
-            'input_size': [3, 299, 299],
+            'input_size': [3, 300, 300],
 
             'input_range': [0, 1],
 
@@ -436,16 +436,12 @@ def xception(num_classes=1000, pretrained='imagenet'):
 
         settings = pretrained_settings['xception'][pretrained]
 
-        assert num_classes == settings['num_classes'], \
-            "num_classes should be {}, but is {}".format(settings['num_classes'], num_classes)
-
-
+        # assert num_classes == settings['num_classes'], \
+        #     "num_classes should be {}, but is {}".format(settings['num_classes'], num_classes)
 
         model = Xception(num_classes=num_classes)
 
         model.load_state_dict(model_zoo.load_url(settings['url']))
-
-
 
         model.input_space = settings['input_space']
 

@@ -5,14 +5,21 @@ import sys
 import random
 import time
 import sys
+from matplotlib import image
 import numpy as np
 import cv2
 import math
 
 from collections import deque
+# import pygame
+try:
+    import pygame
+except ImportError:
+    raise RuntimeError('cannot import pygame, make sure pygame package is installed')
 import tensorflow as tf
 from threading import Thread
 from tqdm import tqdm
+import queue
 
 import matplotlib.pyplot as plt
 import xception
@@ -73,25 +80,84 @@ transform_norm = transforms.Compose([
     std = [0.186295211315155, 0.181921467185020, 0.196240469813347])
 ])
 
+class CarlaSyncMode(object):
+    """
+    Context manager to synchronize output from different sensors. Synchronous
+    mode is enabled as long as we are inside this context
+
+        with CarlaSyncMode(world, sensors) as sync_mode:
+            while True:
+                data = sync_mode.tick(timeout=1.0)
+
+    """
+
+    def __init__(self, world, *sensors, **kwargs):
+        self.world = world
+        self.sensors = sensors
+        self.frame = None
+        self.delta_seconds = 1.0 / kwargs.get('fps', 20)
+        self._queues = []
+        self._settings = None
+
+    def __enter__(self):
+        self._settings = self.world.get_settings()
+        self.frame = self.world.apply_settings(carla.WorldSettings(
+            no_rendering_mode=False,
+            synchronous_mode=True,
+            fixed_delta_seconds=self.delta_seconds))
+
+        def make_queue(register_event):
+            q = queue.Queue()
+            register_event(q.put)
+            self._queues.append(q)
+
+        make_queue(self.world.on_tick)
+        for sensor in self.sensors:
+            make_queue(sensor.listen)
+        return self
+
+    def tick(self, timeout):
+        self.frame = self.world.tick()
+        try:
+            data = [self._retrieve_data(q, timeout) for q in self._queues]
+            assert all(x.frame == self.frame for x in data)
+            return data
+        except:
+            time.sleep(10)
+            self.frame = self.world.tick()
+            data = [self._retrieve_data(q, timeout) for q in self._queues]
+            assert all(x.frame == self.frame for x in data)
+            return data
+
+    def __exit__(self, *args, **kwargs):
+        self.world.apply_settings(self._settings)
+
+    def _retrieve_data(self, sensor_queue, timeout):
+        while True:
+            data = sensor_queue.get(timeout=timeout)
+            if data.frame == self.frame:
+                return data
+
+
 class CarEnv:
     SHOW_CAM = SHOW_PREVIEW
     STEER_AMT = 1.0   ## full turn for every single time
     im_width = IM_WIDTH
     im_height = IM_HEIGHT
-    front_camera = None
+    num_timesteps = 0
 
     def __init__(self):
         self.client = carla.Client('127.0.0.1', 2000)
-        self.client.set_timeout(2.0)
+        self.client.set_timeout(10.0)
         self.world = self.client.load_world('Town04')
         self.map = self.world.get_map()   ## added for map creating
         self.blueprint_library = self.world.get_blueprint_library()
-
         self.model_3 = self.blueprint_library.filter("model3")[0]  ## grab tesla model3 from library
 
     def reset(self):
         self.collision_hist = []    
         self.actor_list = []
+        self.num_timesteps = 1
         
         self.waypoints = self.client.get_world().get_map().generate_waypoints(distance=5.0)
         self.spawn_point = self.waypoints[0].transform
@@ -112,32 +178,23 @@ class CarEnv:
         self.ss_cam.set_attribute("fov", f"110")
 
         transform = carla.Transform(carla.Location(x=2.5, z=0.7))
-        self.sensor = self.world.spawn_actor(self.rgb_cam, transform, attach_to=self.vehicle)
-        self.actor_list.append(self.sensor)
-        self.sensor.listen(lambda data: self.process_img(data))
+        self.rgb_sensor = self.world.spawn_actor(self.rgb_cam, transform, attach_to=self.vehicle)
+        self.actor_list.append(self.rgb_sensor)
         self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0)) # initially passing some commands seems to help with time. Not sure why.
-        time.sleep(4)  # sleep to get things started and to not detect a collision when the car spawns/falls from sky.
-
+        #time.sleep(4)  # sleep to get things started and to not detect a collision when the car spawns/falls from sky.
+        #We need to add trhis after we start the synchronous mode in the main loop
+        
         colsensor = self.world.get_blueprint_library().find('sensor.other.collision')
         self.colsensor = self.world.spawn_actor(colsensor, transform, attach_to=self.vehicle)
-        self.actor_list.append(self.colsensor)
         self.colsensor.listen(lambda event: self.collision_data(event))
-
-        while self.front_camera is None:  ## return the observation
-            time.sleep(0.01)
-
-        self.episode_start = time.time()
-
-        self.vehicle.apply_control(carla.VehicleControl(brake=0.0, throttle=0.0))
-
-        return self.front_camera
+        self.actor_list.append(self.colsensor)
 
     def collision_data(self, event):
         self.collision_hist.append(event)
 
     def process_img(self, image):
         #image.convert(cc.CityScapesPalette)
-        i = np.array(image.raw_data)
+        i = np.array(image.raw_data, dtype=np.dtype("uint8"))
         i2 = i.reshape((self.im_height, self.im_width, 4))
         image = i2[:, :, :3]
        
@@ -175,17 +232,18 @@ class CarEnv:
         aleatoric = np.reshape(aleatoric, (IM_HEIGHT, IM_WIDTH))
         aleatoric = cv2.normalize(src=aleatoric, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
         aleatoric = cv2.merge((aleatoric,aleatoric,aleatoric))
-        ###### Get Uncertainty Image ######
-        cv2.imshow("aleatoric", aleatoric)
-        cv2.waitKey(1)
+        # cv2.imshow("Semantic Segmentation", rgb_semantic)
+        # cv2.imshow("Aleatoric Uncertainty", al)
+        return rgb_semantic, aleatoric
+    
+    def draw_image(self, image):
+        array = np.array(image.raw_data, dtype=np.dtype("uint8"))
+        array = np.reshape(array, (image.height, image.width, 4))
+        array = array[:, :, :3]
+        return array
 
-        cv2.imshow("", rgb_semantic)
-        cv2.waitKey(1)
 
-        self.front_camera = (rgb_semantic, aleatoric)  ## remember to scale this down between 0 and 1 for CNN input purpose
-
-
-    def step(self, action):
+    def step(self, action, sync_mode):
         '''
         For now let's just pass steer left, straight, right
         0, 1, 2
@@ -196,7 +254,7 @@ class CarEnv:
             self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer=1.0*self.STEER_AMT))
         if action == 2:
             self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer=-1.0*self.STEER_AMT))
-
+        
         v = self.vehicle.get_velocity()
         kmh = int(3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2))
       
@@ -216,10 +274,32 @@ class CarEnv:
             done = False
             reward = 30
 
-        if self.episode_start + SECONDS_PER_EPISODE < time.time():  ## when to stop
+        if self.num_timesteps > 300:  ## when to stop
             done = True
 
-        return self.front_camera, reward, done, None
+        try:
+            snapshot, image_rgb = sync_mode.tick(timeout=20.0) #This is resets tick
+        except:
+            print("error")
+            return None, reward, done, True
+        proc_start = time.time()
+        semantic_segmentation, aleatoric_uncertainty = env.process_img(image_rgb)
+        proc_end = time.time()-proc_start
+        # print("Process duration: ", proc_end)
+        image_rgbs = env.draw_image(image_rgb)
+        cv2.imshow("Ground Truth RGB",image_rgbs)
+        cv2.waitKey(1)
+        cv2.imshow("Semantic Segmentation", semantic_segmentation)
+        cv2.waitKey(1)
+        cv2.imshow("Aleatoric Uncertainty", aleatoric_uncertainty)
+        cv2.waitKey(1)
+
+        # cv2.imwrite(("image/"+str(self.num_timesteps)+"_rgb.png"), image_rgbs)
+        # cv2.imwrite(("image/"+str(self.num_timesteps)+"_sem.png"), semantic_segmentation)
+        # cv2.imwrite(("image/"+str(self.num_timesteps)+"_unc.png"), aleatoric_uncertainty)
+        current_state = (semantic_segmentation, aleatoric_uncertainty)
+
+        return current_state, reward, done, None
 
 
 
@@ -231,14 +311,25 @@ class DQNAgent:
         self.replay_memory = deque(maxlen=REPLAY_MEMORY_SIZE)   ## batch step
         self.target_update_counter = 0  # will track when it's time to update the target model
        
-        self.model = fusionModel(semantic_model=self.create_model(), uncertainty_model=self.create_model())
+        self.model = fusionModel(semantic_model=self.create_model(), uncertainty_model=self.create_model()).to(device='cuda:1')
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                if "model" in name:
+                    param.requires_grad = False
+                    print(name)
+        # print("\n\n\n")
+        # for param in self.model.parameters():
+        #     if param.requires_grad:
+        #         print(param)
+
         self.loss = nn.MSELoss()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=0.001)
         self.terminate = False  # Should we quit?
         self.training_initialized = False  # waiting for TF to get rolling
 
     def create_model(self):
-        model = xception.xception(num_classes=2048, pretrained=False).float()#.to(device="cuda:1")
+        model = xception.xception(num_classes=2048, pretrained=False).to(device="cuda:1")
         return model
 
     # Adds step's data to a memory replay array
@@ -254,27 +345,33 @@ class DQNAgent:
 
         ## if we do have the proper amount of data to train, we need to randomly select the data we want to train off from our memory
         minibatch = random.sample(self.replay_memory, MINIBATCH_SIZE)
-
+        torch.cuda.empty_cache()
         states, targets_f = [],[]
         for state, action, reward, next_state, done in minibatch:
             # if done, set target = reward
             #state = state.to(torch.device('cuda:1'))
+
+            #print("Uncertainty input size:", next_state[1].shape)
+            
             target = reward
+            uncertainty_tensor = (torch.unsqueeze(torch.from_numpy(next_state[1]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
+            semantic_tensor = (torch.unsqueeze(torch.from_numpy(next_state[0]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
             # if not done, predict future discounted reward with the Bellman equation
             if not done:
                 target = (reward + DISCOUNT * torch.amax(
-                    self.model(torch.unsqueeze(torch.from_numpy(next_state[0][0]), 0).permute(0,3,1,2)/255,
-                    torch.unsqueeze(torch.from_numpy(next_state[0][1]), 0).permute(0,3,1,2)/255)[0])) #cuda 1 here
-
-            target_f = self.model(torch.unsqueeze(torch.from_numpy(state[0][0]), 0).permute(0,3,1,2)/255,
-             torch.unsqueeze(torch.from_numpy(state[0][1]), 0).permute(0,3,1,2)/255) # cuda 1 here
+                    self.model(semantic_tensor, uncertainty_tensor)[0])) #cuda 1 here
+            
+            uncertainty_target = (torch.unsqueeze(torch.from_numpy(state[1]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
+            semantic_target = (torch.unsqueeze(torch.from_numpy(state[0]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
+            target_f = self.model(semantic_target, uncertainty_target) # cuda 1 here
             target_f[0][action] = target 
+            
             # filtering out states and targets for training
-
-            states.append((state[0][0],state[0][1])) #Add the uncertainty/semantic segmented tuple
+            states.append((state[0],state[1])) #Add the uncertainty/semantic segmented tuple
             targets_f.append(target_f[0])
-        self.model.train()#.to(device='cuda:1')
+        self.model.train().to(device='cuda:1')
 
+        del self.loss
         for i in range(len(states)):
             self.optimizer.zero_grad()
 
@@ -283,18 +380,19 @@ class DQNAgent:
             y    = targets_f[i]
 
             yhat = self.model(x1,x2)
-            self.loss = nn.MSELoss(yhat, y)#.to(device='cuda:1')
+            self.loss = nn.MSELoss(yhat, y).to(device='cuda:1')
 
             self.loss.backward()
             self.optimizer.step()
+        print("training complete for one batch")
 
     def get_qs(self, state):
-        #.to(device='cuda:1')
-        q_out = self.model(
-            torch.unsqueeze(torch.from_numpy(state[0]), 0).permute(0,3,1,2)/255, 
-            torch.unsqueeze(torch.from_numpy(state[1]), 0).permute(0,3,1,2)/255)[0] 
-        return q_out
-
+        torch.cuda.empty_cache()
+        uncertainty_tensor = (torch.unsqueeze(torch.from_numpy(state[1]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
+        semantic_tensor = (torch.unsqueeze(torch.from_numpy(state[0]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
+        q_vector = self.model(semantic_tensor, uncertainty_tensor)[0]
+        return q_vector
+        
     def train_in_loop(self):
         self.training_initialized = True
 
@@ -310,9 +408,8 @@ if __name__ == '__main__':
     ep_rewards = [-200]
 
     # For more repetitive results
-    random.seed(1)
-    np.random.seed(1)
-    tf.random.set_seed(1)
+    #random.seed(1)
+    np.random.seed(2021)
 
     # Create models folder, this is where the model will go 
     if not os.path.isdir('models'):
@@ -333,56 +430,103 @@ if __name__ == '__main__':
     # Iterate over episodes
     for episode in tqdm(range(1, EPISODES + 1), unit='episodes'):
         #try:
-
+            pygame.init()
             env.collision_hist = []
-
-            # Update the target_update to copy from target model
-            agent.target_update_counter += 1
-
             # Restarting episode - reset episode reward and step number
             episode_reward = 0
             step = 1
 
-            # Reset environment and get initial state
-            current_state = env.reset()
-
-            # Reset flag and start iterating until episode ends
+            # Reset environment and sensors etc
+            env.reset()
+            current_state = None
+            # Reset done flag
             done = False
             episode_start = time.time()
             # Play for given number of seconds only
-            while True:
+            #with synchronus mode()
+            #state = rgb
+            with CarlaSyncMode(env.world, env.rgb_sensor, fps=30) as sync_mode:
+                
+                #add initial delay to speed up car spawn
+                for i in range(50):
+                    try:
+                        snapshot, image_rgb = sync_mode.tick(timeout=20.0)
+                    except:
+                        print("error")
+                        break
+                
+                for i in range(25):
+                    try:
+                        snapshot, image_rgb = sync_mode.tick(timeout=20.0)
+                        env.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer= 0.0 ))
+                    except:
+                        print("error")
+                        break
 
-                # np.random.random() will give us the random number between 0 and 1.
-                # If this number is greater than our randomness variable,
-                # we will get Q values based on tranning, but otherwise, we will go random actions.
-                if np.random.random() > epsilon:
-                    # Get action from Q table
-                    action = torch.argmax(agent.get_qs(current_state))
-                else:
-                    # Get random action
-                    action = np.random.randint(0, 3)
-                    # This takes no time, so we add a delay matching 60 FPS (prediction above takes longer)
-                    time.sleep(1/FPS)
-
-                new_state, reward, done, _ = env.step(action)
-
-                # Transform new continous state to new discrete state and count reward
-                episode_reward += reward
-
-                # Every step we update replay memory
-                agent.update_replay_memory((current_state, action, reward, new_state, done))
-
-                current_state = new_state
-                step += 1
-
-                if done:
+                try:
+                    snapshot, image_rgb = sync_mode.tick(timeout=20.0) #This is resets tick
+                except:
+                    print("error")
                     break
+                proc_start = time.time()
+                semantic_segmentation, aleatoric_uncertainty = env.process_img(image_rgb)
+                proc_end = time.time()-proc_start
+                #print("Process duration: ", proc_end)
+                # cv2.imshow("Ground Truth RGB", env.draw_image(image_rgb))
+                # cv2.imshow("Semantic Segmentation", semantic_segmentation)
+                # cv2.imshow("Aleatoric Uncertainty", aleatoric_uncertainty)
+                # cv2.imwrite(("image1/RGB"+str(env.num_timesteps)+".png"), image_rgb)
+                # cv2.imwrite(("image1/Semantic"+str(env.num_timesteps)+".png"), semantic_segmentation)
+                # cv2.imwrite(("image1/Aleatoric"+str(env.num_timesteps)+".png"), aleatoric_uncertainty)
+                current_state = (semantic_segmentation, aleatoric_uncertainty)
+                
+                # for event in pygame.event.get():
+                #     pass
+
+                while True:
+                    #Visualizations#
+
+                    if np.random.random() > epsilon:
+                        # Get action from Q table
+                        start = time.time()
+                        action = torch.argmax(agent.get_qs(current_state))
+                        #print("model time: ", time.time()-start)
+                    else:
+                        # Get random action
+                        action = np.random.randint(0, 3)
+                        # This takes no time, so we add a delay matching 60 FPS (prediction above takes longer)
+                        #time.sleep(0.04)
+
+                    new_state, reward, done, err = env.step(action, sync_mode)
+
+                    if err:
+                        break
+
+                    # Transform new continous state to new discrete state and count reward
+                    episode_reward += reward
+
+                    # Every step we update replay memory
+                    agent.update_replay_memory((current_state, action, reward, new_state, done))
+
+                    current_state = new_state
+                    step += 1
+                    print("step: "+ step+ " reward: "+ reward+" action: ", action)
+                    env.num_timesteps = step
+
+                    if done:
+                        break
+
+            # minibatch = random.sample(agent.replay_memory, MINIBATCH_SIZE)
+            # for state, action, reward, next_state, done in minibatch:
+            #     print("state size: ", state[0].shape)
+            #     print("next state size: ", next_state[1].shape)
 
             episode_list.append(episode)
             rewards.append(episode_reward)
             # End of episode - destroy agents
-            for  actor in env.actor_list:
+            for actor in env.actor_list:
                 actor.destroy()
+            pygame.quit()
 
             # Append episode reward to a list and log stats (every given number of episodes)
             ep_rewards.append(episode_reward)
@@ -395,7 +539,7 @@ if __name__ == '__main__':
             #plt.figure(1)
             plt.xlabel('Episodes')
             plt.ylabel('Rewards')
-            plt.title(str('Training:{:f} '.format(epsilon)))  
+            plt.title(str('Training'))  
             plt.plot(episode_list, rewards)
             plt.savefig('_out/reward_graph.png')
     
