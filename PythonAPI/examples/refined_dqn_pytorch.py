@@ -323,7 +323,7 @@ class DQNAgent:
         #     if param.requires_grad:
         #         print(param)
 
-        self.loss = nn.MSELoss()
+        #self.loss = nn.MSELoss()
         self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=0.001)
         self.terminate = False  # Should we quit?
         self.training_initialized = False  # waiting for TF to get rolling
@@ -347,50 +347,53 @@ class DQNAgent:
         minibatch = random.sample(self.replay_memory, MINIBATCH_SIZE)
         torch.cuda.empty_cache()
         states, targets_f = [],[]
+        torch.autograd.set_detect_anomaly(True)
+        criterion = nn.MSELoss().to(device='cuda:1')
         for state, action, reward, next_state, done in minibatch:
-            # if done, set target = reward
-            #state = state.to(torch.device('cuda:1'))
 
-            #print("Uncertainty input size:", next_state[1].shape)
-            
+            #Belman Equation future rewards calculated 
             target = reward
             uncertainty_tensor = (torch.unsqueeze(torch.from_numpy(next_state[1]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
             semantic_tensor = (torch.unsqueeze(torch.from_numpy(next_state[0]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
             # if not done, predict future discounted reward with the Bellman equation
             if not done:
                 target = (reward + DISCOUNT * torch.amax(
-                    self.model(semantic_tensor, uncertainty_tensor)[0])) #cuda 1 here
+                    self.model(semantic_tensor, uncertainty_tensor)[0]).item()) #cuda 1 here
             
             uncertainty_target = (torch.unsqueeze(torch.from_numpy(state[1]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
             semantic_target = (torch.unsqueeze(torch.from_numpy(state[0]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
             target_f = self.model(semantic_target, uncertainty_target) # cuda 1 here
-            target_f[0][action] = target 
-            
+            target_f[0][action] = target
+            target_f = target_f.detach()
             # filtering out states and targets for training
-            states.append((state[0],state[1])) #Add the uncertainty/semantic segmented tuple
-            targets_f.append(target_f[0])
-        self.model.train().to(device='cuda:1')
+            states.append((semantic_target,uncertainty_target)) #Add the uncertainty/semantic segmented tuple
+            targets_f.append(target_f)
 
-        del self.loss
+
+        self.model.train().to(device='cuda:1')
+        #del self.loss
         for i in range(len(states)):
             self.optimizer.zero_grad()
 
-            x1    = states[i][0] #Semantic
+            x1    = states[i][0]#Semantic
             x2    = states[i][1]#Uncertainty
-            y    = targets_f[i]
+            y     = targets_f[i]
+            #print("target y size: ", y.shape)
 
             yhat = self.model(x1,x2)
-            self.loss = nn.MSELoss(yhat, y).to(device='cuda:1')
+           ## print("yhat: ", yhat.shape)
+            loss=criterion(yhat, y)
 
-            self.loss.backward()
+            loss.backward()
             self.optimizer.step()
-        print("training complete for one batch")
+       # print("training complete for one batch")
 
     def get_qs(self, state):
         torch.cuda.empty_cache()
         uncertainty_tensor = (torch.unsqueeze(torch.from_numpy(state[1]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
         semantic_tensor = (torch.unsqueeze(torch.from_numpy(state[0]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
         q_vector = self.model(semantic_tensor, uncertainty_tensor)[0]
+        #print("q vector: ", q_vector.item())
         return q_vector
         
     def train_in_loop(self):
@@ -406,7 +409,7 @@ if __name__ == '__main__':
     FPS = 20
     # For stats
     ep_rewards = [-200]
-
+    process_start = time.time()
     # For more repetitive results
     #random.seed(1)
     np.random.seed(2021)
@@ -489,7 +492,7 @@ if __name__ == '__main__':
                     if np.random.random() > epsilon:
                         # Get action from Q table
                         start = time.time()
-                        action = torch.argmax(agent.get_qs(current_state))
+                        action = torch.argmax(agent.get_qs(current_state)).item()
                         #print("model time: ", time.time()-start)
                     else:
                         # Get random action
@@ -510,7 +513,7 @@ if __name__ == '__main__':
 
                     current_state = new_state
                     step += 1
-                    print("step: "+ step+ " reward: "+ reward+" action: ", action)
+                    print("step: "+ str(step)+ " reward: "+str(reward)+" action: ", str(action))
                     env.num_timesteps = step
 
                     if done:
@@ -542,7 +545,8 @@ if __name__ == '__main__':
             plt.title(str('Training'))  
             plt.plot(episode_list, rewards)
             plt.savefig('_out/reward_graph.png')
-    
+
+    print("Total Runtime for 100 Episodes: ", time.time()-process_start)
     # Set termination flag for training thread and wait for it to finish
     agent.terminate = True
     trainer_thread.join()

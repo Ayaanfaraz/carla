@@ -460,7 +460,7 @@ def xception(num_classes=1000, pretrained='imagenet'):
 
         model.input_space = settings['input_space']
 
-        model.input_size = [3, 480, 640]
+        model.input_size = [3, 300, 300]
 
         model.input_range = settings['input_range']
 
