@@ -18,6 +18,7 @@ except ImportError:
     raise RuntimeError('cannot import pygame, make sure pygame package is installed')
 import tensorflow as tf
 from threading import Thread
+from multiprocessing import Process
 from tqdm import tqdm
 import queue
 
@@ -386,7 +387,7 @@ class DQNAgent:
 
             loss.backward()
             self.optimizer.step()
-       # print("training complete for one batch")
+        print("training complete for one batch")
 
     def get_qs(self, state):
         torch.cuda.empty_cache()
@@ -403,7 +404,7 @@ class DQNAgent:
             if self.terminate:
                 return
             self.train()
-            time.sleep(0.01)
+            #time.sleep(0.4)
 
 if __name__ == '__main__':
     FPS = 20
@@ -423,10 +424,10 @@ if __name__ == '__main__':
     env = CarEnv()
 
     # Start training thread and wait for training to be initialized
-    trainer_thread = Thread(target=agent.train_in_loop, daemon=True)
+    trainer_thread = Process(target=agent.train_in_loop, daemon=True)
     trainer_thread.start()
-    while not agent.training_initialized:
-        time.sleep(0.01)
+    # while not agent.training_initialized:
+    #     time.sleep(0.1)
 
     rewards = []
     episode_list = []
