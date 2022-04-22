@@ -51,7 +51,7 @@ IM_HEIGHT = 300
 TIMESTEPS_PER_EPISODE = 400
 REPLAY_MEMORY_SIZE = 15_000
 
-MIN_REPLAY_MEMORY_SIZE = 100
+MIN_REPLAY_MEMORY_SIZE = 1000
 MINIBATCH_SIZE = 16
 PREDICTION_BATCH_SIZE = 1
 TRAINING_BATCH_SIZE = MINIBATCH_SIZE // 4
@@ -189,10 +189,14 @@ class CarEnv:
         self.ss_cam.set_attribute("image_size_x", f"{self.im_width}")
         self.ss_cam.set_attribute("image_size_y", f"{self.im_height}")
         self.ss_cam.set_attribute("fov", f"110")
+        
 
         transform = carla.Transform(carla.Location(x=2.5, z=0.7))
         self.rgb_sensor = self.world.spawn_actor(self.rgb_cam, transform, attach_to=self.vehicle)
         self.actor_list.append(self.rgb_sensor)
+        
+        self.sem_sensor = self.world.spawn_actor(self.ss_cam, transform, attach_to=self.vehicle)
+        self.actor_list.append(self.sem_sensor)
         self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0)) # initially passing some commands seems to help with time. Not sure why.
         #time.sleep(4)  # sleep to get things started and to not detect a collision when the car spawns/falls from sky.
         #We need to add trhis after we start the synchronous mode in the main loop
@@ -204,6 +208,13 @@ class CarEnv:
 
     def collision_data(self, event):
         self.collision_hist.append(event)
+
+    def process_sem(self, image):
+        image.convert(cc.CityScapesPalette)
+        i = np.array(image.raw_data)
+        i2 = i.reshape((self.im_height, self.im_width, 4))
+        i3 = i2[:, :, :3]
+        return i3
 
     def process_img(self, image):
         #image.convert(cc.CityScapesPalette)
@@ -225,29 +236,9 @@ class CarEnv:
         rgb_semantic = cv2.normalize(src=rgb_semantic, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
         ##### Get Semantic Image #######
 
-
-        #### Get Uncertainty Image ######
-        semantic_uncertainty_model.train().to(device='cuda:0')
-        mc_results = []
-        output = semantic_uncertainty_model(rgb_input).detach().cpu().numpy()
-        output = np.squeeze(output)
-        # RESHAPE OUTPUT BEFORE PUTTING IT INTO mc_results
-        # reshape into (480000, 23)
-        # then softmax it
-        output = jerrys_helpers.get_pixels(output)
-        output = jerrys_helpers.softmax(output)
-        mc_results.append(output)
-        
-        # boom we got num_samples passes of a single img thru the NN
-        # now we use those samples to make uncertainty maps  
-        mc_results = [mc_results]
-        aleatoric = jerrys_helpers.calc_aleatoric(mc_results)[0]
-        aleatoric = np.reshape(aleatoric, (IM_HEIGHT, IM_WIDTH))
-        aleatoric = cv2.normalize(src=aleatoric, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        aleatoric = cv2.merge((aleatoric,aleatoric,aleatoric))
         # cv2.imshow("Semantic Segmentation", rgb_semantic)
         # cv2.imshow("Aleatoric Uncertainty", al)
-        return rgb_semantic, aleatoric
+        return rgb_semantic
     
     def draw_image(self, image):
         array = np.array(image.raw_data, dtype=np.dtype("uint8"))
@@ -280,20 +271,7 @@ class CarEnv:
         #                             persistent_lines=True)
                                     
             dist = round(carla.Location.distance(car_location, nearest_waypoint.transform.location),2)
-        # done = False
-        # reward = 1
 
-        # if kmh < 30:
-        #     reward = -0.5
-        # if nearest_waypoint is not None and dist <= 0.4:
-        #   #  print("hit waypoint")
-        #     reward = 5
-        # if nearest_waypoint is not None and dist > 0.7:
-        #    # print("away")
-        #     reward = -2.5
-        # if len(self.collision_hist) != 0:
-        #     done = True
-        #     reward = -50
         if len(self.collision_hist) != 0:
             done = True
             reward = -300
@@ -310,13 +288,13 @@ class CarEnv:
             done = True
 
         try:
-            snapshot, image_rgb = sync_mode.tick(timeout=20.0) #This is next state image
+            snapshot, image_rgb, image_semantic = sync_mode.tick(timeout=20.0) #This is next state image
         except:
             print("error")
             return None, reward, done, True #return reward for old state and next state image
 
         proc_start = time.time()
-        semantic_segmentation, aleatoric_uncertainty = env.process_img(image_rgb)
+        semantic_segmentation = env.process_sem(image_semantic)
         proc_end = time.time()-proc_start
         # print("Process duration: ", proc_end)
         image_rgbs = env.draw_image(image_rgb)
@@ -324,13 +302,8 @@ class CarEnv:
         cv2.waitKey(1)
         cv2.imshow("Semantic Segmentation", semantic_segmentation)
         cv2.waitKey(1)
-        cv2.imshow("Aleatoric Uncertainty", aleatoric_uncertainty)
-        cv2.waitKey(1)
 
-        # cv2.imwrite(("image/"+str(self.num_timesteps)+"_rgb.png"), image_rgbs)
-        # cv2.imwrite(("image/"+str(self.num_timesteps)+"_sem.png"), semantic_segmentation)
-        # cv2.imwrite(("image/"+str(self.num_timesteps)+"_unc.png"), aleatoric_uncertainty)
-        current_state = (semantic_segmentation, aleatoric_uncertainty)
+        current_state = semantic_segmentation
 
         return current_state, reward, done, dist
 
@@ -344,13 +317,14 @@ class DQNAgent:
         self.replay_memory = deque(maxlen=REPLAY_MEMORY_SIZE)   ## batch step
         self.target_update_counter = 0  # will track when it's time to update the target model
        
-        self.model = fusionModel(semantic_model=self.create_model(), uncertainty_model=self.create_model()).to(device='cuda:1')
-        
+        self.model = self.create_model() # Single xception model
+
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                if "model" in name:
+                #print(name)
+                if not "last_linear" in name:
                     param.requires_grad = False
-                    #print(name)
+                    print(name)
 
         #self.loss = nn.MSELoss()
         self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=0.001)
@@ -358,7 +332,7 @@ class DQNAgent:
         self.training_initialized = False  # waiting for TF to get rolling
 
     def create_model(self):
-        model = xception.xception(num_classes=2048, pretrained=False).to(device="cuda:1")
+        model = xception.xception(num_classes=3, pretrained=False).to(device="cuda:1")
         return model
 
     # Adds step's data to a memory replay array
@@ -382,20 +356,18 @@ class DQNAgent:
 
             #Belman Equation future rewards calculated 
             target = reward
-            uncertainty_tensor = (torch.unsqueeze(torch.from_numpy(next_state[1]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
-            semantic_tensor = (torch.unsqueeze(torch.from_numpy(next_state[0]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
+            semantic_tensor = (torch.unsqueeze(torch.from_numpy(next_state), 0).permute(0,3,1,2)/255).to(device='cuda:1')
             # if not done, predict future discounted reward with the Bellman equation
             if not done:
                 target = (reward + DISCOUNT * torch.amax(
-                    self.model(semantic_tensor, uncertainty_tensor)[0]).item()) #cuda 1 here
+                    self.model(semantic_tensor)[0]).item()) #cuda 1 here
             
-            uncertainty_target = (torch.unsqueeze(torch.from_numpy(state[1]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
-            semantic_target = (torch.unsqueeze(torch.from_numpy(state[0]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
-            target_f = self.model(semantic_target, uncertainty_target) # cuda 1 here torch.tensor([0.9, 0.7, 0.5])
+            semantic_target = (torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255).to(device='cuda:1')
+            target_f = self.model(semantic_target) # cuda 1 here torch.tensor([0.9, 0.7, 0.5])
             target_f[0][action] = target
             target_f = target_f.detach()
             # filtering out states and targets for training
-            states.append((semantic_target,uncertainty_target)) #Add the uncertainty/semantic segmented tuple
+            states.append(semantic_target) #Add the uncertainty/semantic segmented tuple
             print(target_f)
             targets_f.append(target_f)
 
@@ -405,13 +377,10 @@ class DQNAgent:
         for i in range(len(states)):
             self.optimizer.zero_grad()
 
-            x1    = states[i][0]#Semantic
-            x2    = states[i][1]#Uncertainty
+            x1    = states[i] #Semantic
             y     = targets_f[i]
-            #print("target y size: ", y.shape)
 
-            yhat = self.model(x1,x2)
-           ## print("yhat: ", yhat.shape)
+            yhat = self.model(x1)
             loss=criterion(yhat, y)
 
             loss.backward()
@@ -420,9 +389,8 @@ class DQNAgent:
 
     def get_qs(self, state):
         torch.cuda.empty_cache()
-        uncertainty_tensor = (torch.unsqueeze(torch.from_numpy(state[1]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
-        semantic_tensor = (torch.unsqueeze(torch.from_numpy(state[0]), 0).permute(0,3,1,2)/255).to(device='cuda:1')
-        q_vector = self.model(semantic_tensor, uncertainty_tensor)[0]
+        semantic_tensor = (torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255).to(device='cuda:1')
+        q_vector = self.model(semantic_tensor)[0]
         #print("q vector: ", q_vector.item())
         return q_vector
         
@@ -478,12 +446,12 @@ if __name__ == '__main__':
             # Play for given number of seconds only
             #with synchronus mode()
             #state = rgb
-            with CarlaSyncMode(env.world, env.rgb_sensor, fps=30) as sync_mode:
+            with CarlaSyncMode(env.world, env.rgb_sensor, env.sem_sensor, fps=30) as sync_mode:
                 
                 #add initial delay to speed up car spawn
                 for i in range(50):
                     try:
-                        snapshot, image_rgb = sync_mode.tick(timeout=20.0)
+                        snapshot, image_rgb, image_semantic = sync_mode.tick(timeout=20.0)
                     except:
                         print("error")
                         break
@@ -497,24 +465,15 @@ if __name__ == '__main__':
                         break
 
                 try:
-                    snapshot, image_rgb = sync_mode.tick(timeout=20.0) #This is resets tick
+                    snapshot, image_rgb, image_semantic = sync_mode.tick(timeout=20.0) #This is resets tick
                 except:
                     print("error")
                     break
                 proc_start = time.time()
-                semantic_segmentation, aleatoric_uncertainty = env.process_img(image_rgb)
+                semantic_segmentation = env.process_sem(image_semantic)
                 proc_end = time.time()-proc_start
-                #print("Process duration: ", proc_end)
-                # cv2.imshow("Ground Truth RGB", env.draw_image(image_rgb))
-                # cv2.imshow("Semantic Segmentation", semantic_segmentation)
-                # cv2.imshow("Aleatoric Uncertainty", aleatoric_uncertainty)
-                # cv2.imwrite(("image1/RGB"+str(env.num_timesteps)+".png"), image_rgb)
-                # cv2.imwrite(("image1/Semantic"+str(env.num_timesteps)+".png"), semantic_segmentation)
-                # cv2.imwrite(("image1/Aleatoric"+str(env.num_timesteps)+".png"), aleatoric_uncertainty)
-                current_state = (semantic_segmentation, aleatoric_uncertainty)
-                
-                # for event in pygame.event.get():
-                #     pass
+
+                current_state = semantic_segmentation
 
                 while True:
                     #Visualizations#
@@ -552,11 +511,6 @@ if __name__ == '__main__':
                     if done:
                         break
 
-            # minibatch = random.sample(agent.replay_memory, MINIBATCH_SIZE)
-            # for state, action, reward, next_state, done in minibatch:
-            #     print("state size: ", state[0].shape)
-            #     print("next state size: ", next_state[1].shape)
-
             episode_list.append(episode)
             rewards.append(episode_reward)
             # End of episode - destroy agents
@@ -575,7 +529,7 @@ if __name__ == '__main__':
             #plt.figure(1)
             plt.xlabel('Episodes')
             plt.ylabel('Rewards')
-            plt.title(str('Training: Random Actions no Model'))  
+            plt.title(str('Training: Ground Truth Semantic, Single Model'))  
             plt.plot(episode_list, rewards)
             plt.savefig('_out/reward_graph.png')
 
