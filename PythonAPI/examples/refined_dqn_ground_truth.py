@@ -9,6 +9,7 @@ from matplotlib import image
 import numpy as np
 import cv2
 import math
+import pickle
 
 from collections import deque
 # import pygame
@@ -49,26 +50,20 @@ from carla import ColorConverter as cc
 IM_WIDTH = 300
 IM_HEIGHT = 300
 TIMESTEPS_PER_EPISODE = 400
-REPLAY_MEMORY_SIZE = 15_000
+REPLAY_MEMORY_SIZE = 10_000
 
 MIN_REPLAY_MEMORY_SIZE = 1000
-MINIBATCH_SIZE = 16
+MINIBATCH_SIZE = 64
 PREDICTION_BATCH_SIZE = 1
 TRAINING_BATCH_SIZE = MINIBATCH_SIZE // 4
-MODEL_NAME = "Xception"
 
-MEMORY_FRACTION = 0.8
-MIN_REWARD = -200
+EPISODES = 10_000
 
-EPISODES = 100
-
-DISCOUNT = 0.99
+DISCOUNT = 0.99 # Maybe change to 0.999?
 epsilon = 1
-EPSILON_DECAY = 0.95 ## 0.9975 99975
+EPSILON_DECAY = 0.9991#0.9659 ## 0.9975 99975
 MIN_EPSILON = 0.001
-
-AGGREGATE_STATS_EVERY = 5  ## checking per 5 episodes
-SHOW_PREVIEW  = True    ## for debugging purpose
+Var = 0
 
 #Load up Jerrys pretrained model
 semantic_uncertainty_model = tiramisu.FCDenseNet67(n_classes=23).to(device='cuda:0')
@@ -141,7 +136,6 @@ class CarlaSyncMode(object):
 
 
 class CarEnv:
-    SHOW_CAM = SHOW_PREVIEW
     STEER_AMT = 1.0   ## full turn for every single time
     im_width = IM_WIDTH
     im_height = IM_HEIGHT
@@ -156,11 +150,16 @@ class CarEnv:
         self.model_3 = self.blueprint_library.filter("model3")[0]  ## grab tesla model3 from library
 
     def reset(self):
-        self.collision_hist = []    
+        self.collision_hist = []
+        self.obstacle_data=[]    
         self.actor_list = []
         self.num_timesteps = 1
         
-        self.waypoints = self.client.get_world().get_map().generate_waypoints(distance=3.0)
+        try:
+            self.waypoints = self.client.get_world().get_map().generate_waypoints(distance=3.0)
+        except:
+            time.sleep(10)
+            self.waypoints = self.client.get_world().get_map().generate_waypoints(distance=3.0)
 
         # for i in range(len(self.waypoints)):
         #             self.world.debug.draw_string(self.waypoints[i].transform.location, 'O', draw_shadow=False,
@@ -173,12 +172,12 @@ class CarEnv:
         self.vehicle = self.world.spawn_actor(self.model_3, self.spawn_point)  ## changed for adding waypoints
 
         obstacle_location = self.spawn_point
-        obstacle_location.location.x -= 20
+        obstacle_location.location.x -= 38
         #print (self.world.get_blueprint_library())
-        #self.obstacle = self.world.spawn_actor(self.world.get_blueprint_library().filter('bmw')[0], obstacle_location)
+        self.obstacle = self.world.spawn_actor(self.world.get_blueprint_library().filter('bmw')[0], obstacle_location)
 
         self.actor_list.append(self.vehicle)
-       # self.actor_list.append(self.obstacle)
+        self.actor_list.append(self.obstacle)
 
         self.rgb_cam = self.blueprint_library.find('sensor.camera.rgb')
         self.rgb_cam.set_attribute("image_size_x", f"{self.im_width}")
@@ -206,8 +205,17 @@ class CarEnv:
         self.colsensor.listen(lambda event: self.collision_data(event))
         self.actor_list.append(self.colsensor)
 
+        obstacle_detector = self.world.get_blueprint_library().find('sensor.other.obstacle')
+        obstacle_detector.set_attribute("distance", f"17")
+        self.obstacle_detector = self.world.spawn_actor(obstacle_detector, transform, attach_to=self.vehicle)
+        self.obstacle_detector.listen(lambda event: self.obstacle_hist(event))
+        self.actor_list.append(self.obstacle_detector)
+
     def collision_data(self, event):
         self.collision_hist.append(event)
+    
+    def obstacle_hist(self, event):
+        self.obstacle_data.append(event)
 
     def process_sem(self, image):
         image.convert(cc.CityScapesPalette)
@@ -253,40 +261,43 @@ class CarEnv:
         0, 1, 2
         '''
         if action == 0:
-            self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer= 0.0 ))
+            self.vehicle.apply_control(carla.VehicleControl(throttle=0.5, steer= 0.0 ))
         if action == 1:
-            self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer=1.0*self.STEER_AMT))
+            self.vehicle.apply_control(carla.VehicleControl(throttle=0.5, steer=1.0*self.STEER_AMT))
         if action == 2:
-            self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer=-1.0*self.STEER_AMT))
+            self.vehicle.apply_control(carla.VehicleControl(throttle=0.5, steer=-1.0*self.STEER_AMT))
         
         v = self.vehicle.get_velocity()
         kmh = int(3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2))
       
         car_location = carla.Actor.get_location(self.actor_list[0])
-        nearest_waypoint = self.client.get_world().get_map().get_waypoint(car_location,project_to_road=True, lane_type=(carla.LaneType.Driving))#self.initial_waypoint.next(3.0)[0]#
-        dist = None
-        if nearest_waypoint is not None:
-        #     self.world.debug.draw_string(nearest_waypoint.transform.location, 'O', draw_shadow=False,
-        #                             color=carla.Color(r=0, g=255, b=0), life_time=40,
-        #                             persistent_lines=True)
+        # nearest_waypoint = self.client.get_world().get_map().get_waypoint(car_location,project_to_road=True, lane_type=(carla.LaneType.Driving))#self.initial_waypoint.next(3.0)[0]#
+        # dist = None
+        # if nearest_waypoint is not None:
+        # #     self.world.debug.draw_string(nearest_waypoint.transform.location, 'O', draw_shadow=False,
+        # #                             color=carla.Color(r=0, g=255, b=0), life_time=40,
+        # #                             persistent_lines=True)
                                     
-            dist = round(carla.Location.distance(car_location, nearest_waypoint.transform.location),2)
-
+        #     dist = round(carla.Location.distance(car_location, nearest_waypoint.transform.location),2)
+        reward = 0
         if len(self.collision_hist) != 0:
             done = True
-            reward = -300
+            reward = -100
+        elif len(self.obstacle_data)!=0 :
+            reward = -15+self.obstacle_data[-1].distance
+            done = False
         elif kmh < 30:
             done = False
             reward = -5
-        elif nearest_waypoint is not None and dist <= 0.4:
-            done = False
-            reward = 25
+        # elif nearest_waypoint is not None and dist <= 0.4:
+        #     done = False
+        #     reward = 25
         else:
             done = False
-            reward = 30
+            reward = 5
         if self.num_timesteps > TIMESTEPS_PER_EPISODE:  ## when to stop
             done = True
-
+        
         try:
             snapshot, image_rgb, image_semantic = sync_mode.tick(timeout=20.0) #This is next state image
         except:
@@ -305,16 +316,23 @@ class CarEnv:
 
         current_state = semantic_segmentation
 
-        return current_state, reward, done, dist
+        return current_state, reward, done, None
 
 
 
 class DQNAgent:
-    def __init__(self):
+    def __init__(self, loaded_state):
 
 
         ## replay_memory is used to remember the sized previous actions, and then fit our model of this amout of memory by doing random sampling
         self.replay_memory = deque(maxlen=REPLAY_MEMORY_SIZE)   ## batch step
+        try:
+            with open('_out/replay_memory.pkl','rb') as f:
+                self.replay_memory = pickle.load(f)
+        except:
+            print("replay load error")
+            pass
+
         self.target_update_counter = 0  # will track when it's time to update the target model
        
         self.model = self.create_model() # Single xception model
@@ -324,16 +342,24 @@ class DQNAgent:
                 #print(name)
                 if not "last_linear" in name:
                     param.requires_grad = False
-                    print(name)
+                    #print(name)
 
         #self.loss = nn.MSELoss()
         self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=0.001)
         self.terminate = False  # Should we quit?
         self.training_initialized = False  # waiting for TF to get rolling
 
+        try:
+            self.model.load_state_dict(loaded_state['model_state_dict'])
+            self.optimizer.load_state_dict(loaded_state['optimizer'])
+        except:
+            print("Model state error")
+            pass
+
+
     def create_model(self):
-        model = xception.xception(num_classes=3, pretrained=False).to(device="cuda:1")
-        return model
+        return xception.xception(num_classes=3, pretrained=False).to(device="cuda:1")
+        #return model
 
     # Adds step's data to a memory replay array
     # (observation space, action, reward, new observation space, done)= (current_state, action, reward, new_state, done)
@@ -352,6 +378,8 @@ class DQNAgent:
         states, targets_f = [],[]
         torch.autograd.set_detect_anomaly(True)
         criterion = nn.MSELoss().to(device='cuda:1')
+        uncertainty_states = []
+        semantic_states = []
         for state, action, reward, next_state, done in minibatch:
 
             #Belman Equation future rewards calculated 
@@ -361,38 +389,51 @@ class DQNAgent:
             if not done:
                 target = (reward + DISCOUNT * torch.amax(
                     self.model(semantic_tensor)[0]).item()) #cuda 1 here
+                del semantic_tensor
             
             semantic_target = (torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255).to(device='cuda:1')
+            # size is 1, 300, 300, 3
+            # size 4, 300, 300, 3
             target_f = self.model(semantic_target) # cuda 1 here torch.tensor([0.9, 0.7, 0.5])
+            del semantic_target
+
             target_f[0][action] = target
             target_f = target_f.detach()
             # filtering out states and targets for training
-            states.append(semantic_target) #Add the uncertainty/semantic segmented tuple
-            print(target_f)
-            targets_f.append(target_f)
 
+            semantic_state = (torch.from_numpy(state).permute(2,0,1)/255).to(device='cuda:1')
 
+            semantic_states.append(semantic_state) #Add the uncertainty/semantic segmented tuple
+            del semantic_state
+
+            targets_f.append(torch.squeeze(target_f)) # 16 1 by 3 tensors (list of q value outputs)
+        # print("targets_f: ", targets_f)
+        
         self.model.train().to(device='cuda:1')
         #del self.loss
-        for i in range(len(states)):
+        for i in range(TRAINING_BATCH_SIZE):
             self.optimizer.zero_grad()
+            x1    = torch.stack((semantic_states[i:i+TRAINING_BATCH_SIZE]))#Semantic -> [[3x4]] -> 1x3x4 -> #
 
-            x1    = states[i] #Semantic
-            y     = targets_f[i]
-
+            y     = torch.stack(targets_f[i:i+TRAINING_BATCH_SIZE]) #batch size of 4 labels
+            # print("y shape is:", y.shape)
             yhat = self.model(x1)
+            # print("yhat is: ",yhat.shape) #4,3 tensor
+            
             loss=criterion(yhat, y)
-
             loss.backward()
             self.optimizer.step()
-        print("training complete for one batch")
+
+            i+=TRAINING_BATCH_SIZE
+        # print("training complete for one batch")
 
     def get_qs(self, state):
         torch.cuda.empty_cache()
-        semantic_tensor = (torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255).to(device='cuda:1')
-        q_vector = self.model(semantic_tensor)[0]
-        #print("q vector: ", q_vector.item())
-        return q_vector
+        with torch.no_grad():
+            return self.model(
+                (torch.unsqueeze(torch.from_numpy(state), 0).permute(0,3,1,2)/255).to(device='cuda:1'))[0]
+            #print("q vector: ", q_vector.item())
+            #return q_vector
         
     def train_in_loop(self):
         self.training_initialized = True
@@ -416,8 +457,17 @@ if __name__ == '__main__':
     if not os.path.isdir('models'):
         os.makedirs('models')
 
+    startEpisode = 1
+    loaded_state = None
+    try:
+        loaded_state = torch.load('models/saved_model.pt')
+        epsilon = loaded_state['epsilon']
+        startEpisode = loaded_state['episode']
+        print("Start at Episode: ", startEpisode)
+    except:
+        pass
     # Create agent and environment
-    agent = DQNAgent()
+    agent = DQNAgent(loaded_state)
     env = CarEnv()
 
     # Start training thread and wait for training to be initialized
@@ -425,14 +475,24 @@ if __name__ == '__main__':
     trainer_thread.start()
     # while not agent.training_initialized:
     #     time.sleep(0.1)
-
+    
     rewards = []
     episode_list = []
+    
+    try: 
+        with open('_out/episode_list.pkl','rb') as f:
+            episode_list = pickle.load(f)
+        with open('_out/rewards_list.pkl','rb') as f:
+            rewards = pickle.load(f)
+    except:
+        pass
+        
     # Iterate over episodes
-    for episode in tqdm(range(1, EPISODES + 1), unit='episodes'):
+    for episode in tqdm(range(startEpisode, startEpisode+500), unit='episodes'):
         #try:
             pygame.init()
             env.collision_hist = []
+            env.obstacle_data = []
             # Restarting episode - reset episode reward and step number
             episode_reward = 0
             step = 1
@@ -446,7 +506,7 @@ if __name__ == '__main__':
             # Play for given number of seconds only
             #with synchronus mode()
             #state = rgb
-            with CarlaSyncMode(env.world, env.rgb_sensor, env.sem_sensor, fps=30) as sync_mode:
+            with CarlaSyncMode(env.world, env.rgb_sensor, env.sem_sensor, fps=20) as sync_mode:
                 
                 #add initial delay to speed up car spawn
                 for i in range(50):
@@ -490,7 +550,7 @@ if __name__ == '__main__':
                         #time.sleep(0.04)
 
                     ## For one action, apply it twice so the car can actually apply angle 
-                    for i in range(4):
+                    for i in range(2):
                         new_state, reward, done, err = env.step(action, sync_mode)
                     ##
 
@@ -501,11 +561,12 @@ if __name__ == '__main__':
                     episode_reward += reward
 
                     # Every step we update replay memory
-                    agent.update_replay_memory((current_state, action, reward, new_state, done))
+                    if step > 30:
+                        agent.update_replay_memory((current_state, action, reward, new_state, done))
 
                     current_state = new_state
                     step += 1
-                    print("step: "+ str(step)+ " reward: "+str(reward)+" action: ", str(action) + " waypoint: ", str(err))
+                    print("step: "+ str(step)+ " reward: "+str(reward)+" action: ", str(action))
                     env.num_timesteps = step
 
                     if done:
@@ -516,24 +577,50 @@ if __name__ == '__main__':
             # End of episode - destroy agents
             for actor in env.actor_list:
                 actor.destroy()
+            #agent.train()
             pygame.quit()
-
-            # Append episode reward to a list and log stats (every given number of episodes)
-            ep_rewards.append(episode_reward)
 
             # Decay epsilon
             if epsilon > MIN_EPSILON:
                 epsilon *= EPSILON_DECAY
                 epsilon = max(MIN_EPSILON, epsilon)
             
-            #plt.figure(1)
+            plt.figure(1)
             plt.xlabel('Episodes')
             plt.ylabel('Rewards')
-            plt.title(str('Training: Ground Truth Semantic, Single Model'))  
+            plt.title(str('Training Obstacle: Ground Truth Single Model'))  
             plt.plot(episode_list, rewards)
             plt.savefig('_out/reward_graph.png')
 
-    print("Total Runtime for 100 Episodes: ", time.time()-process_start)
+            # plt.figure(2)
+            # plt.xlabel('Timesteps')
+            # plt.ylabel('Epsilon')
+            # plt.title(str('Epsilon Decay'))  
+            # plt.plot(timesteps, rewards)
+            # plt.savefig('_out/reward_graph.png')
+    
+    try: 
+        with open('_out/episode_list.pkl','wb') as f:
+            pickle.dump(episode_list,f)
+        with open('_out/rewards_list.pkl','wb') as f:
+            pickle.dump(rewards,f)
+        with open('_out/replay_memory.pkl','wb') as f:
+            pickle.dump(agent.replay_memory,f)
+
+        state = {
+            'epsilon': epsilon,
+            'episode': episode+1,
+            'model_state_dict': agent.model.state_dict(),
+            'optimizer': agent.optimizer.state_dict()
+                }
+
+        torch.save(state, 'models/saved_model.pt')
+    except:
+        print("Error with pickle files")
+        pass
+        
+    print("Epsilon at 500 episodes: ", epsilon)   
+    print("Total Runtime for 500 Episodes: ", time.time()-process_start)
     # Set termination flag for training thread and wait for it to finish
     agent.terminate = True
     torch.cuda.empty_cache()
